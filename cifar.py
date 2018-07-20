@@ -9,6 +9,7 @@ import os
 import shutil
 import time
 import random
+import itertools
 
 import torch
 import torch.nn as nn
@@ -19,6 +20,8 @@ import torch.utils.data as data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models.cifar as models
+import dropbranch.layers as sb_nn
+import custom_layer as custom_nn
 
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 
@@ -50,6 +53,8 @@ parser.add_argument('--schedule', type=int, nargs='+', default=[150, 225],
 parser.add_argument('--gamma', type=float, default=0.1, help='LR is multiplied by gamma on schedule.')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
+parser.add_argument('--sb_momentum', default=None, type=float, metavar='M',
+                    help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
 # Checkpoints
@@ -75,6 +80,7 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
 #Device options
 parser.add_argument('--gpu-id', default='0', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
+parser.add_argument('--dual', default=False, action='store_true')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -103,8 +109,6 @@ def main():
     if not os.path.isdir(args.checkpoint):
         mkdir_p(args.checkpoint)
 
-
-
     # Data
     print('==> Preparing dataset %s' % args.dataset)
     transform_train = transforms.Compose([
@@ -124,7 +128,6 @@ def main():
     else:
         dataloader = datasets.CIFAR100
         num_classes = 100
-
 
     trainset = dataloader(root='./data', train=True, download=True, transform=transform_train)
     trainloader = data.DataLoader(trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.workers)
@@ -165,32 +168,66 @@ def main():
     else:
         model = models.__dict__[args.arch](num_classes=num_classes)
 
-    model = torch.nn.DataParallel(model).cuda()
+    model = model.cuda()
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+
+    sb_param = []
+    bn_param = []
+    other_param = []
+    ref_bn = []
+    ref_do = []
+
+    def divide_param(m):
+        nonlocal sb_param
+        nonlocal bn_param
+        nonlocal other_param
+
+        for m in m.children():
+            if isinstance(m, nn.Sequential) or isinstance(m, nn.DataParallel) or isinstance(m, models.VGG) or isinstance(m, models.DoBnBlock):
+                divide_param(m)
+            elif isinstance(m, sb_nn.StochasticLinear) or isinstance(m, sb_nn.StochasticConv2d):
+                sb_param += list(m.parameters())
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d) or isinstance(m, custom_nn.BatchNorm2d):
+                bn_param += list(m.parameters())
+                ref_bn.append(m)
+            elif isinstance(m, nn.Dropout):
+                ref_do.append(m)
+            else:
+                other_param += list(m.parameters())
+    divide_param(model)
+
+    bn_optimizer = optim.SGD(bn_param, momentum=args.momentum, lr=args.lr, weight_decay=args.weight_decay)
+    other_optimizer = optim.SGD([{"params": other_param, "momentum": args.momentum},
+                                 {"params": sb_param, "momentum":args.sb_momentum if args.sb_momentum is not None else args.momentum}
+                                 ], lr=args.lr, weight_decay=args.weight_decay)
 
     # Resume
     title = 'cifar-10-' + args.arch
-    if args.resume:
-        # Load checkpoint.
-        print('==> Resuming from checkpoint..')
+    # if args.resume:
+    #     # Load checkpoint.
+    #     print('==> Resuming from checkpoint..')
+    #     assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
+    #     args.checkpoint = os.path.dirname(args.resume)
+    #     checkpoint = torch.load(args.resume)
+    #     best_acc = checkpoint['best_acc']
+    #     start_epoch = checkpoint['epoch']
+    #     model.load_state_dict(checkpoint['state_dict'])
+    #
+    #     optimizer.load_state_dict(checkpoint['optimizer'])
+    #     logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
+    # else:
+    logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
+    logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
+
+    if args.evaluate:
+        print('==> Loading from checkpoint..')
         assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
         args.checkpoint = os.path.dirname(args.resume)
         checkpoint = torch.load(args.resume)
-        best_acc = checkpoint['best_acc']
-        start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
-    else:
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
-        logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
-
-
-    if args.evaluate:
         print('\nEvaluation only')
         test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
@@ -198,11 +235,14 @@ def main():
 
     # Train and val
     for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
+        adjust_learning_rate(other_optimizer, epoch, update=True)
+        adjust_learning_rate(bn_optimizer, epoch, update=False)
 
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
-        train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda)
+        train_loss, train_acc = train(trainloader, model, criterion, epoch, use_cuda,
+                                      other_optim=other_optimizer, bn_optim=bn_optimizer,
+                                      ref_bn=ref_bn, ref_do=ref_do)
         test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda)
 
         # append logger file
@@ -216,7 +256,6 @@ def main():
                 'state_dict': model.state_dict(),
                 'acc': test_acc,
                 'best_acc': best_acc,
-                'optimizer' : optimizer.state_dict(),
             }, is_best, checkpoint=args.checkpoint)
 
     logger.close()
@@ -226,8 +265,10 @@ def main():
     print('Best acc:')
     print(best_acc)
 
-def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
-    # switch to train mode
+
+def train(trainloader, model, criterion, epoch, use_cuda,
+          other_optim=None, bn_optim=None, ref_bn=[], ref_do=[]):
+
     model.train()
 
     batch_time = AverageMeter()
@@ -236,15 +277,28 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
     top1 = AverageMeter()
     top5 = AverageMeter()
     end = time.time()
-
     bar = Bar('Processing', max=len(trainloader))
+
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda(async=True)
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
+
+        if args.dual:
+            for r in ref_bn:
+                r.use_registered = False
+            for r in ref_do:
+                r.eval()
+
+            with torch.no_grad():
+                outputs = model(inputs)  # to estimate variance
+
+            for r in ref_bn:
+                r.use_registered = True
+            for r in ref_do:
+                r.train()
 
         # compute output
         outputs = model(inputs)
@@ -252,34 +306,47 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-        losses.update(loss.data[0], inputs.size(0))
-        top1.update(prec1[0], inputs.size(0))
-        top5.update(prec5[0], inputs.size(0))
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(prec1.item(), inputs.size(0))
+        top5.update(prec5.item(), inputs.size(0))
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
+        other_optim.zero_grad()
+        bn_optim.zero_grad()
+
         loss.backward()
-        optimizer.step()
+
+        other_optim.step()
+        bn_optim.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-                    batch=batch_idx + 1,
-                    size=len(trainloader),
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    total=bar.elapsed_td,
-                    eta=bar.eta_td,
-                    loss=losses.avg,
-                    top1=top1.avg,
-                    top5=top5.avg,
-                    )
+        bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                     batch=batch_idx + 1,
+                     size=len(trainloader),
+                     data=data_time.avg,
+                     bt=batch_time.avg,
+                     total=bar.elapsed_td,
+                     eta=bar.eta_td,
+                     loss=losses.avg,
+                     top1=top1.avg,
+                     top5=top5.avg)
+
         bar.next()
+
+    # Recover to current running stat
+    if args.dual:
+        for r in ref_bn:
+            r.use_registered = False
+        for r in ref_do:
+            r.train()
+
     bar.finish()
     return (losses.avg, top1.avg)
+
 
 def test(testloader, model, criterion, epoch, use_cuda):
     global best_acc
@@ -301,24 +368,24 @@ def test(testloader, model, criterion, epoch, use_cuda):
 
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
-        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
 
         # compute output
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        with torch.no_grad():
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-        losses.update(loss.data[0], inputs.size(0))
-        top1.update(prec1[0], inputs.size(0))
-        top5.update(prec5[0], inputs.size(0))
+        losses.update(loss.item(), inputs.size(0))
+        top1.update(prec1.item(), inputs.size(0))
+        top5.update(prec5.item(), inputs.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+        bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
                     batch=batch_idx + 1,
                     size=len(testloader),
                     data=data_time.avg,
@@ -327,11 +394,12 @@ def test(testloader, model, criterion, epoch, use_cuda):
                     eta=bar.eta_td,
                     loss=losses.avg,
                     top1=top1.avg,
-                    top5=top5.avg,
-                    )
+                    top5=top5.avg)
         bar.next()
     bar.finish()
+
     return (losses.avg, top1.avg)
+
 
 def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
     filepath = os.path.join(checkpoint, filename)
@@ -339,10 +407,12 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
     if is_best:
         shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
 
-def adjust_learning_rate(optimizer, epoch):
+
+def adjust_learning_rate(optimizer, epoch, update=False):
     global state
     if epoch in args.schedule:
-        state['lr'] *= args.gamma
+        if update:
+            state['lr'] *= args.gamma
         for param_group in optimizer.param_groups:
             param_group['lr'] = state['lr']
 

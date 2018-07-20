@@ -4,11 +4,14 @@
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import math
+import dropbranch.layers as sb_nn
+import custom_layer as custom_nn
 
 
 __all__ = [
     'VGG', 'vgg11', 'vgg11_bn', 'vgg13', 'vgg13_bn', 'vgg16', 'vgg16_bn',
-    'vgg19_bn', 'vgg19',
+    'vgg19_bn', 'vgg19', 'sb1_vgg19_bn', 'sb2_vgg19_bn', 'vgg19_bn_do', 'vgg19_do',
+    'DoBnBlock'
 ]
 
 
@@ -21,7 +24,6 @@ model_urls = {
 
 
 class VGG(nn.Module):
-
     def __init__(self, features, num_classes=1000):
         super(VGG, self).__init__()
         self.features = features
@@ -50,20 +52,50 @@ class VGG(nn.Module):
                 m.bias.data.zero_()
 
 
-def make_layers(cfg, batch_norm=False):
+def make_layers(cfg, batch_norm=False, dropout=False):
     layers = []
     in_channels = 3
-    for v in cfg:
+    for i, v in enumerate(cfg):
         if v == 'M':
             layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
         else:
-            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
-            if batch_norm:
-                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+            if str(v).startswith('SB'):
+                v = int(str(v).split('_')[1])
+                conv2d = sb_nn.StochasticElementConv2d(in_channels, v, kernel_size=3, padding=1, n_branch=10, p=0.5)
             else:
-                layers += [conv2d, nn.ReLU(inplace=True)]
+                conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+
+            block = []
+            if dropout and cfg[i - 1] != 'M' and in_channels >= 256:
+                block = [nn.Dropout(p=0.5)]
+
+            if batch_norm:
+                #if len(block) == 1:
+                #    block = [DoBnBlock(block[0], conv2d, custom_nn.BatchNorm2d(v)), nn.ReLU(inplace=True)]
+                #else:
+                block += [conv2d, custom_nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+            else:
+                block += [conv2d, nn.ReLU(inplace=True)]
+
             in_channels = v
+            layers += block
     return nn.Sequential(*layers)
+
+
+class DoBnBlock(nn.Module):
+    def __init__(self, do, linear, bn):
+        super(DoBnBlock, self).__init__()
+        self.do = do
+        self.linear = linear
+        self.bn = bn
+
+    def forward(self, x):
+        if self.training:
+            do_x = self.do(x)
+            return self.bn(self.linear(do_x), self.linear(x))
+        else:
+            return self.bn(self.linear(self.do(x)))
+
 
 
 cfg = {
@@ -71,6 +103,8 @@ cfg = {
     'B': [64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
     'D': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M'],
     'E': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512, 'M'],
+    'E_SB1': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 'SB_512', 'M'],
+    'E_SB2': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 'SB_512', 'SB_512', 'M']
 }
 
 
@@ -136,3 +170,32 @@ def vgg19_bn(**kwargs):
     """VGG 19-layer model (configuration 'E') with batch normalization"""
     model = VGG(make_layers(cfg['E'], batch_norm=True), **kwargs)
     return model
+
+
+def vgg19_do(**kwargs):
+    """VGG 19-layer model (configuration "E")
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = VGG(make_layers(cfg['E'], dropout=True), **kwargs)
+    return model
+
+
+def vgg19_bn_do(**kwargs):
+    """VGG 16-layer model (configuration "D") with batch normalization"""
+    model = VGG(make_layers(cfg['E'], batch_norm=True, dropout=True), **kwargs)
+    return model
+
+
+def sb1_vgg19_bn(**kwargs):
+    """VGG 19-layer model (configuration 'E') with batch normalization"""
+    model = VGG(make_layers(cfg['E_SB1'], batch_norm=True), **kwargs)
+    return model
+
+
+def sb2_vgg19_bn(**kwargs):
+    """VGG 19-layer model (configuration 'E') with batch normalization"""
+    model = VGG(make_layers(cfg['E_SB2'], batch_norm=True), **kwargs)
+    return model
+
